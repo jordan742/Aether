@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0.0",
+  "source": "orbital-gateway",
+  "timestamp": null,
+  "scene": {
+    "tile_id": null,
+    "acquisition_date": null,
+    "cloud_cover_pct": null,
+    "bbox": null
+  },
+  "spectral": {
+    "ndvi_mean": null,
+    "ndvi_std": null,
+    "ndwi_mean": null,
+    "evi_mean": null
+  },
+  "anomaly": {
+    "detected": false,
+    "type": null,
+    "confidence": null,
+    "affected_area_km2": null
+  },
+  "signal": {
+    "ticker": null,
+    "direction": null,
+    "strength": null
+  },
+  "status": "initializing"
+}
