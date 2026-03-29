@@ -35,6 +35,8 @@ from .sentinel import SentinelFetcher
 from .yolo_detector import ShipDetector
 from .signal_engine import derive_signal
 
+_OVERRIDE_FLAG = Path(__file__).parent.parent / "shared" / "OVERRIDE"
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +69,10 @@ class OrbitalGateway:
                     self._fetcher.port, self.interval)
 
         while self._running:
+            if _OVERRIDE_FLAG.exists():
+                logger.critical("SYSTEM OVERRIDE detected — Orbital Gateway halting.")
+                self._running = False
+                break
             try:
                 await self._tick()
             except Exception as exc:

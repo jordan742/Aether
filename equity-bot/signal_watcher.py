@@ -25,7 +25,11 @@ The telemetry schema this module consumes (written by orbital-gateway):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from shared.bridge import TelemetryBridge
 from .alpaca_client import AlpacaClient
@@ -37,6 +41,10 @@ logger = logging.getLogger(__name__)
 MIN_STRENGTH: float = 0.3   # signals below this are ignored
 MAX_PCT: float = 0.05       # max fraction of equity risked per trade
 DEFAULT_POLL: int = 5       # default polling interval in seconds
+
+_ROOT          = Path(__file__).parent.parent
+_OVERRIDE_FLAG = _ROOT / "shared" / "OVERRIDE"
+_TRADES_LOG    = _ROOT / "shared" / "trades.jsonl"
 
 
 class SignalWatcher:
@@ -79,6 +87,10 @@ class SignalWatcher:
         )
 
         while not self._stop_flag[0]:
+            if _OVERRIDE_FLAG.exists():
+                logger.critical("SYSTEM OVERRIDE detected — SignalWatcher halting.")
+                self._stop_flag[0] = True
+                break
             try:
                 telemetry = await self.bridge.read()
 
@@ -157,6 +169,9 @@ class SignalWatcher:
             logger.warning("Unknown direction '%s' — no order placed.", direction)
             return
 
+        # ── Append to trade log (consumed by dashboard P&L ticker) ────────────
+        self._log_trade(ticker, direction, notional)
+
         # ── Post-trade circuit breaker check ──────────────────────────────────
         try:
             await self.breaker.check(await self.alpaca.get_equity())
@@ -170,3 +185,21 @@ class SignalWatcher:
             await self.alpaca.cancel_all_orders()
             await self.alpaca.close_all_positions()
             raise
+
+    # ── Trade logger ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_trade(ticker: str, direction: str, notional: float) -> None:
+        """Append a trade record to shared/trades.jsonl for dashboard consumption."""
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ticker": ticker,
+            "direction": direction,
+            "notional": notional,
+            "pnl": None,   # filled in by a future reconciliation pass
+        }
+        try:
+            with _TRADES_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            logger.warning("Could not write trade log: %s", exc)
