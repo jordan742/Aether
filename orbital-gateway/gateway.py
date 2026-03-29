@@ -91,7 +91,8 @@ class OrbitalGateway:
         # 3. Derive trading signal from ship count vs. historical baseline
         signal = derive_signal(scene, detection)
 
-        # 4. Build schema v2.1.0 payload (timestamp injected by bridge.write)
+        # 4. Build schema v3.0.0 payload (timestamp injected by bridge.write)
+        vb = detection.vessel_breakdown
         _detection_plain = {
             "model":           "yolov8n-ship",
             "ship_count":      detection.ship_count,
@@ -99,12 +100,15 @@ class OrbitalGateway:
             "large_vessels":   detection.large_vessels,
             "small_vessels":   detection.small_vessels,
             "inference_ms":    detection.inference_ms,
+            "vessel_breakdown": {
+                "tankers":       vb.tankers,
+                "bulk_carriers": vb.bulk_carriers,
+                "container":     vb.container,
+            },
         }
 
-        # Orion encrypts the detection block — if cipher is active the entire
-        # detection dict is replaced with a Fernet token string stored under
-        # "detection_enc"; the plaintext "detection" key is omitted so that
-        # proprietary ship-count intelligence is never written in the clear.
+        # Orion encrypts the full detection block via Fernet.
+        # Proprietary vessel intelligence never touches disk in plaintext.
         if _cipher.is_active:
             detection_field = {"detection_enc": _cipher.encrypt(_detection_plain)}
             logger.debug("Detection block encrypted (Fernet).")
@@ -112,8 +116,9 @@ class OrbitalGateway:
             detection_field = {"detection": _detection_plain}
 
         payload: dict = {
-            "schema_version": "2.1.0",
-            "source": "orbital-gateway",
+            "schema_version": "3.0.0",
+            "classification":  "PROPRIETARY_ALPHA",
+            "source":          "orbital-gateway",
             "scene": {
                 "tile_id":          scene.tile_id,
                 "acquisition_date": scene.acquisition_date,
@@ -122,11 +127,27 @@ class OrbitalGateway:
                 "port":             scene.port,
             },
             **detection_field,
-            "signal": {
-                "ticker":    signal.ticker,
-                "direction": signal.direction,
-                "strength":  signal.strength,
-                "rationale": signal.rationale,
+            # ── Orbital Truth — physical world observation ─────────────────────
+            "orbital_truth": {
+                "observation_type": (
+                    f"{signal.dominant_type}_density_spike"
+                    if signal.direction == "BUY"
+                    else f"{signal.dominant_type}_density_drop"
+                    if signal.direction == "SELL"
+                    else "vessel_count_nominal"
+                ),
+                "delta_pct":           signal.delta_pct,
+                "dominant_vessel_type": signal.dominant_type,
+                "thesis":              signal.thesis,
+            },
+            # ── Alpha Signal — financial instruction to Midas ──────────────────
+            "alpha_signal": {
+                "ticker":     signal.ticker,
+                "sector":     signal.sector,
+                "direction":  signal.direction,
+                "conviction": signal.conviction,
+                "strength":   signal.strength,
+                "rationale":  signal.rationale,
             },
             "status": "active",
         }
@@ -134,11 +155,15 @@ class OrbitalGateway:
         # 5. Atomic write to shared/telemetry.json (bridge stamps timestamp)
         await self.bridge.write(payload)
         logger.info(
-            "Telemetry written — port=%s tile=%s ships=%d signal=%s(%.2f) encrypted=%s",
+            "Uplink — port=%s ships=%d Δ=%.1f%% type=%s conviction=%s "
+            "signal=%s %s(%.2f) enc=%s",
             scene.port,
-            scene.tile_id,
             detection.ship_count,
+            signal.delta_pct,
+            signal.dominant_type,
+            signal.conviction,
             signal.direction,
+            signal.ticker,
             signal.strength,
             _cipher.is_active,
         )

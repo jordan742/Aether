@@ -1,5 +1,6 @@
 {
-  "schema_version": "2.1.0",
+  "schema_version": "3.0.0",
+  "classification": "PROPRIETARY_ALPHA",
   "source": "orbital-gateway",
   "timestamp": null,
   "scene": {
@@ -11,9 +12,17 @@
   },
   "detection": null,
   "detection_enc": null,
-  "signal": {
+  "orbital_truth": {
+    "observation_type": null,
+    "delta_pct": null,
+    "dominant_vessel_type": null,
+    "thesis": null
+  },
+  "alpha_signal": {
     "ticker": null,
+    "sector": null,
     "direction": null,
+    "conviction": null,
     "strength": null,
     "rationale": null
   },

@@ -1,25 +1,49 @@
 """
-Signal Watcher
---------------
-Continuously polls the Sovereign Bridge (shared/telemetry.json) and executes
-paper trades on Alpaca whenever a fresh, actionable signal is detected.
+Signal Watcher — Midas: The Executioner
+-----------------------------------------
+Continuously polls the Sovereign Bridge and converts Orion's Proprietary
+Truth into conviction-weighted, volatility-adjusted Alpaca paper trades.
 
-The telemetry schema this module consumes (written by orbital-gateway):
+Schema v3.0.0 contract (written by orbital-gateway):
 
     {
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
+        "classification": "PROPRIETARY_ALPHA",
         "source": "orbital-gateway",
-        "timestamp": "2026-03-29T12:00:00+00:00",
-        "scene": { "port": "strait_of_gibraltar", ... },
-        "detection": { "ship_count": 47, ... },
-        "signal": {
-            "ticker": "BDRY",
+        "timestamp": "...",
+        "scene": { "port": "strait_of_hormuz", ... },
+        "detection_enc": "<fernet_token>",        ← Orion encrypts
+        "orbital_truth": {
+            "observation_type": "tanker_density_spike",
+            "delta_pct": 15.2,
+            "dominant_vessel_type": "tankers",
+            "thesis": "15.2% tanker surplus at Hormuz ..."
+        },
+        "alpha_signal": {
+            "ticker": "XOM",
+            "sector": "energy",
             "direction": "BUY",
-            "strength": 0.74,
-            "rationale": "ship_count_above_30d_avg"
+            "conviction": "HIGH",
+            "strength": 0.82,
+            "rationale": "vessel_count_15.2pct_above_30d_avg"
         },
         "status": "active"
     }
+
+Execution Logic
+    1. Decrypt detection block (Fernet).
+    2. Extract alpha_signal: direction, conviction, strength, ticker.
+    3. Fetch VIX. Determine regime and position multiplier.
+    4. If PANIC (VIX ≥ 40): BLOCK execution entirely.
+    5. Compute notional = equity × conviction_pct × vix_multiplier.
+    6. Execute market order. Log to shared/trades.jsonl.
+    7. Post-trade circuit breaker check.
+
+Conviction → Base Position PCT
+    EXTREME  → 8 % of equity
+    HIGH     → 5 % of equity
+    MEDIUM   → 2.5 % of equity
+    LOW      → skip (below threshold)
 """
 
 from __future__ import annotations
@@ -27,7 +51,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,13 +58,19 @@ from shared.bridge import TelemetryBridge
 from shared.crypto import cipher as _cipher
 from .alpaca_client import AlpacaClient
 from .circuit_breaker import StarkCircuitBreaker, CircuitBreakerTripped
+from .market_context import MarketContext
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level constants ─────────────────────────────────────────────────────
-MIN_STRENGTH: float = 0.3   # signals below this are ignored
-MAX_PCT: float = 0.05       # max fraction of equity risked per trade
-DEFAULT_POLL: int = 5       # default polling interval in seconds
+# ── Conviction → base position percentage ──────────────────────────────────────
+_CONVICTION_PCT: dict[str, float] = {
+    "EXTREME": 0.08,
+    "HIGH":    0.05,
+    "MEDIUM":  0.025,
+    "LOW":     0.0,    # skipped
+}
+
+DEFAULT_POLL: int = 5   # seconds between bridge polls
 
 _ROOT          = Path(__file__).parent.parent
 _OVERRIDE_FLAG = _ROOT / "shared" / "OVERRIDE"
@@ -50,8 +79,8 @@ _TRADES_LOG    = _ROOT / "shared" / "trades.jsonl"
 
 class SignalWatcher:
     """
-    Reads the Sovereign Bridge on a fixed cadence and converts signals into
-    Alpaca paper trades, subject to the Stark Circuit Breaker.
+    Reads the Sovereign Bridge, verifies against VIX, and fires trades.
+    Midas does not trade blind — he is The Executioner, not a gambler.
     """
 
     def __init__(
@@ -62,29 +91,24 @@ class SignalWatcher:
         poll_interval: int = DEFAULT_POLL,
         _stop_flag: list[bool] | None = None,
     ) -> None:
-        self.bridge = bridge
-        self.alpaca = alpaca
-        self.breaker = breaker
+        self.bridge        = bridge
+        self.alpaca        = alpaca
+        self.breaker       = breaker
         self.poll_interval = poll_interval
         self._last_ts: str | None = None
-        # Optional shared stop-flag so EquityBot.stop() can halt the loop
-        self._stop_flag = _stop_flag if _stop_flag is not None else [False]
+        self._stop_flag    = _stop_flag if _stop_flag is not None else [False]
+        self._market_ctx   = MarketContext()
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def watch(self) -> None:
         """
-        Main polling loop.
-
-        Runs until:
-        - CircuitBreakerTripped is raised (re-raised to caller), or
-        - The shared stop flag is set (clean exit).
+        Main polling loop. Runs until CircuitBreakerTripped or stop flag set.
         """
         logger.info(
-            "SignalWatcher started — poll_interval=%ds MIN_STRENGTH=%.2f MAX_PCT=%.0f%%",
+            "Midas (The Executioner) online — poll=%ds conviction_pcts=%s",
             self.poll_interval,
-            MIN_STRENGTH,
-            MAX_PCT * 100,
+            {k: f"{v:.0%}" for k, v in _CONVICTION_PCT.items() if v > 0},
         )
 
         while not self._stop_flag[0]:
@@ -94,79 +118,94 @@ class SignalWatcher:
                 break
             try:
                 telemetry = await self.bridge.read()
-
                 if await self._is_new_signal(telemetry):
                     await self._process(telemetry)
-
             except CircuitBreakerTripped:
-                raise  # propagate to EquityBot.run()
+                raise
             except Exception as exc:
-                logger.error("SignalWatcher cycle error: %s", exc, exc_info=True)
+                logger.error("Cycle error: %s", exc, exc_info=True)
 
             await asyncio.sleep(self.poll_interval)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     async def _is_new_signal(self, telemetry: dict) -> bool:
-        """Return True when *telemetry* carries a timestamp we haven't seen."""
         ts = telemetry.get("timestamp")
-        if ts is None or ts == self._last_ts:
-            return False
-        return True
+        return bool(ts and ts != self._last_ts)
 
     async def _process(self, telemetry: dict) -> None:
-        """Evaluate the telemetry signal and, if actionable, execute a trade."""
-        # ── Midas decrypts the detection block if Orion encrypted it ──────────
+        """Evaluate signal, apply VIX gate, execute conviction-sized trade."""
+
+        # ── 1. Midas decrypts Orion's proprietary detection block ──────────────
         if "detection_enc" in telemetry:
             telemetry["detection"] = _cipher.decrypt(telemetry["detection_enc"])
             logger.debug("Detection block decrypted (Fernet).")
 
-        # ── Extract fields per handshake contract ──────────────────────────────
-        direction: str = telemetry["signal"]["direction"]
-        strength: float = float(telemetry["signal"]["strength"])
-        ticker: str = telemetry["signal"]["ticker"]
-        ship_count: int = int(telemetry["detection"]["ship_count"])
-        port: str = telemetry.get("scene", {}).get("port", "unknown")
-        ts: str = telemetry["timestamp"]
+        # ── 2. Extract v3.0.0 fields ───────────────────────────────────────────
+        alpha   = telemetry.get("alpha_signal") or telemetry.get("signal") or {}
+        truth   = telemetry.get("orbital_truth") or {}
+        detect  = telemetry.get("detection") or {}
+        scene   = telemetry.get("scene") or {}
 
-        logger.info(
-            "Signal — port=%s ship_count=%d direction=%s strength=%.3f ticker=%s",
-            port,
-            ship_count,
-            direction,
-            strength,
-            ticker,
-        )
+        direction  = alpha.get("direction", "HOLD")
+        conviction = alpha.get("conviction", "LOW")
+        strength   = float(alpha.get("strength") or 0.0)
+        ticker     = alpha.get("ticker", "—")
+        sector     = alpha.get("sector", "unknown")
+        thesis     = truth.get("thesis", "—")
+        delta_pct  = float(truth.get("delta_pct") or 0.0)
+        dom_type   = truth.get("dominant_vessel_type", "mixed")
+        port       = scene.get("port", "unknown")
+        ts         = telemetry.get("timestamp", "")
 
-        # Mark timestamp as processed regardless of whether we trade
         self._last_ts = ts
 
-        # ── Guard checks ───────────────────────────────────────────────────────
+        logger.info(
+            "Uplink received — port=%s Δ=%.1f%% type=%s conviction=%s "
+            "direction=%s %s",
+            port, delta_pct, dom_type, conviction, direction, ticker,
+        )
+        logger.info("Thesis: %s", thesis)
+
+        # ── 3. Skip non-actionable signals ─────────────────────────────────────
         if direction == "HOLD":
-            logger.info("Direction=HOLD — no action taken.")
+            logger.info("Direction=HOLD — standing down.")
             return
 
-        if strength < MIN_STRENGTH:
-            logger.info(
-                "Signal strength %.3f below MIN_STRENGTH %.2f — skipping.",
-                strength,
-                MIN_STRENGTH,
+        base_pct = _CONVICTION_PCT.get(conviction, 0.0)
+        if base_pct == 0.0:
+            logger.info("Conviction=LOW — below execution threshold.")
+            return
+
+        # ── 4. VIX gate — Midas verifies against market volatility ────────────
+        vix_snap   = await self._market_ctx.get_vix()
+        vix_mult   = self._market_ctx.position_multiplier(vix_snap, conviction)
+
+        if vix_mult == 0.0:
+            logger.critical(
+                "VIX PANIC GATE ACTIVE — VIX=%.2f (%s). "
+                "Thesis blocked: %s",
+                vix_snap.value, vix_snap.regime, thesis,
             )
             return
 
-        # ── Size and execute order ─────────────────────────────────────────────
-        equity = await self.alpaca.get_equity()
-        notional = round(equity * MAX_PCT * strength, 2)
-
         logger.info(
-            "Executing %s %s — equity=$%.2f notional=$%.2f (strength=%.3f)",
-            direction,
-            ticker,
-            equity,
-            notional,
-            strength,
+            "VIX=%.2f %s — position multiplier=×%.2f",
+            vix_snap.value, vix_snap.regime, vix_mult,
         )
 
+        # ── 5. Size the order ──────────────────────────────────────────────────
+        equity   = await self.alpaca.get_equity()
+        notional = round(equity * base_pct * vix_mult, 2)
+
+        logger.info(
+            "EXECUTING %s %s [%s] — equity=$%.2f "
+            "base=%.0f%% vix_mult=×%.2f notional=$%.2f | %s",
+            direction, ticker, conviction,
+            equity, base_pct * 100, vix_mult, notional, thesis,
+        )
+
+        # ── 6. Fire the order ──────────────────────────────────────────────────
         if direction == "BUY":
             await self.alpaca.market_buy(ticker, notional)
         elif direction == "SELL":
@@ -175,18 +214,27 @@ class SignalWatcher:
             logger.warning("Unknown direction '%s' — no order placed.", direction)
             return
 
-        # ── Append to trade log (consumed by dashboard P&L ticker) ────────────
-        self._log_trade(ticker, direction, notional)
+        # ── 7. Trade log for dashboard + cycle_runner ──────────────────────────
+        self._log_trade(
+            ticker=ticker,
+            direction=direction,
+            notional=notional,
+            conviction=conviction,
+            sector=sector,
+            delta_pct=delta_pct,
+            vix=vix_snap.value,
+            vix_regime=vix_snap.regime,
+            thesis=thesis,
+        )
 
-        # ── Post-trade circuit breaker check ──────────────────────────────────
+        # ── 8. Post-trade circuit breaker check ────────────────────────────────
         try:
             await self.breaker.check(await self.alpaca.get_equity())
         except CircuitBreakerTripped as exc:
             logger.critical(
-                "Circuit breaker tripped after trade — loss=%.2f%% threshold=%.2f%%. "
-                "Initiating emergency shutdown.",
-                exc.loss_pct * 100,
-                exc.threshold * 100,
+                "STARK CIRCUIT BREAKER — loss=%.2f%% threshold=%.2f%%. "
+                "Flattening all positions.",
+                exc.loss_pct * 100, exc.threshold * 100,
             )
             await self.alpaca.cancel_all_orders()
             await self.alpaca.close_all_positions()
@@ -195,14 +243,23 @@ class SignalWatcher:
     # ── Trade logger ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _log_trade(ticker: str, direction: str, notional: float) -> None:
-        """Append a trade record to shared/trades.jsonl for dashboard consumption."""
+    def _log_trade(
+        ticker: str, direction: str, notional: float,
+        conviction: str, sector: str, delta_pct: float,
+        vix: float, vix_regime: str, thesis: str,
+    ) -> None:
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ticker": ticker,
-            "direction": direction,
-            "notional": notional,
-            "pnl": None,   # filled in by a future reconciliation pass
+            "timestamp":  datetime.now(timezone.utc).isoformat(),
+            "ticker":     ticker,
+            "direction":  direction,
+            "notional":   notional,
+            "conviction": conviction,
+            "sector":     sector,
+            "delta_pct":  delta_pct,
+            "vix":        vix,
+            "vix_regime": vix_regime,
+            "thesis":     thesis,
+            "pnl":        None,
         }
         try:
             with _TRADES_LOG.open("a", encoding="utf-8") as fh:
