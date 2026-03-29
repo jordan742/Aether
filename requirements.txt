@@ -1,5 +1,6 @@
 # Core
 python-dotenv>=1.0.0
+cryptography>=42.0.0
 
 # Orbital Gateway — Sentinel-2 imagery
 httpx>=0.27.0

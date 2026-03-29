@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from shared.bridge import TelemetryBridge
+from shared.crypto import cipher as _cipher
 from .alpaca_client import AlpacaClient
 from .circuit_breaker import StarkCircuitBreaker, CircuitBreakerTripped
 
@@ -115,6 +116,11 @@ class SignalWatcher:
 
     async def _process(self, telemetry: dict) -> None:
         """Evaluate the telemetry signal and, if actionable, execute a trade."""
+        # ── Midas decrypts the detection block if Orion encrypted it ──────────
+        if "detection_enc" in telemetry:
+            telemetry["detection"] = _cipher.decrypt(telemetry["detection_enc"])
+            logger.debug("Detection block decrypted (Fernet).")
+
         # ── Extract fields per handshake contract ──────────────────────────────
         direction: str = telemetry["signal"]["direction"]
         strength: float = float(telemetry["signal"]["strength"])

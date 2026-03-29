@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "source": "orbital-gateway",
   "timestamp": null,
   "scene": {
@@ -9,14 +9,8 @@
     "bbox": null,
     "port": null
   },
-  "detection": {
-    "model": "yolov8n-ship",
-    "ship_count": null,
-    "confidence_mean": null,
-    "large_vessels": null,
-    "small_vessels": null,
-    "inference_ms": null
-  },
+  "detection": null,
+  "detection_enc": null,
   "signal": {
     "ticker": null,
     "direction": null,
