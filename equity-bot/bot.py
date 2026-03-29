@@ -1,13 +1,13 @@
 """
 Equity Bot
 ----------
-Quantitative execution engine.
+Quantitative execution engine for Aether Fund One.
 
 Lifecycle:
   1. On startup: read opening equity, arm the Stark Circuit Breaker.
-  2. Every cycle: read the Sovereign Bridge for a fresh telemetry signal.
-  3. Execute a market order sized by signal strength (max 5 % of portfolio per trade).
-  4. Check the circuit breaker — auto-kill if daily loss >= 2 %.
+  2. Create a SignalWatcher and hand it control.
+  3. SignalWatcher polls the Sovereign Bridge and fires trades.
+  4. Circuit breaker auto-kills on daily loss >= threshold (default 2 %).
 
 Run directly:
     python -m equity-bot
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -32,6 +31,7 @@ load_dotenv()
 from shared.bridge import TelemetryBridge
 from .alpaca_client import AlpacaClient
 from .circuit_breaker import StarkCircuitBreaker, CircuitBreakerTripped
+from .signal_watcher import SignalWatcher
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -39,13 +39,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 
-_POLL_INTERVAL = int(os.getenv("TELEMETRY_INTERVAL", "60"))
-_MAX_POSITION_PCT = 0.05   # max 5 % of equity per trade
-_MIN_SIGNAL_STRENGTH = 0.3  # ignore weak signals below this threshold
-
 
 class EquityBot:
-    """Reads telemetry signals and executes paper trades via Alpaca."""
+    """Reads telemetry signals via SignalWatcher and executes paper trades."""
 
     def __init__(
         self,
@@ -56,79 +52,38 @@ class EquityBot:
         self.bridge = bridge or TelemetryBridge()
         self.alpaca = alpaca or AlpacaClient()
         self.breaker = breaker or StarkCircuitBreaker()
-        self._running = False
-        self._last_signal_ts: str | None = None
-
-        # Register emergency shutdown hook with the circuit breaker
-        self.breaker.register_shutdown_callback(self._emergency_shutdown)
+        # Shared mutable stop flag — a single-element list so SignalWatcher
+        # can observe mutations made by stop().
+        self._stop_flag: list[bool] = [False]
 
     async def run(self) -> None:
-        """Start the main trading loop."""
-        self._running = True
-        equity = self.alpaca.get_equity()
+        """Start the trading loop: arm the breaker, then delegate to SignalWatcher."""
+        equity = await self.alpaca.get_equity()
         await self.breaker.initialise(starting_equity=equity)
-        logger.info("Equity Bot online — equity=$%.2f", equity)
+        logger.info("Equity Bot online — opening equity=$%.2f", equity)
 
-        while self._running:
-            try:
-                await self._cycle()
-            except CircuitBreakerTripped as exc:
-                logger.critical(str(exc))
-                self._running = False
-                break
-            except Exception as exc:
-                logger.error("Cycle error: %s", exc, exc_info=True)
-            await asyncio.sleep(_POLL_INTERVAL)
+        watcher = SignalWatcher(
+            bridge=self.bridge,
+            alpaca=self.alpaca,
+            breaker=self.breaker,
+            _stop_flag=self._stop_flag,
+        )
 
-    async def _cycle(self) -> None:
-        """Single trading cycle: read bridge → evaluate → execute → check breaker."""
-        telemetry = await self.bridge.read()
-
-        # Skip stale or uninitialised signals
-        ts = telemetry.get("timestamp")
-        if ts == self._last_signal_ts:
-            logger.debug("No new telemetry since last cycle.")
-            return
-
-        signal = telemetry.get("signal", {})
-        direction = signal.get("direction")
-        strength = float(signal.get("strength") or 0.0)
-        ticker = signal.get("ticker")
-
-        if not ticker or not direction or direction == "HOLD":
-            logger.info("Signal: HOLD — no action.")
-        elif strength < _MIN_SIGNAL_STRENGTH:
-            logger.info("Signal strength %.2f below threshold — skipping.", strength)
-        else:
-            equity = self.alpaca.get_equity()
-            notional = round(equity * _MAX_POSITION_PCT * strength, 2)
-            logger.info(
-                "Executing %s %s — notional=$%.2f (strength=%.2f)",
-                direction, ticker, notional, strength,
-            )
-            if direction == "BUY":
-                self.alpaca.market_buy(ticker, notional)
-            elif direction == "SELL":
-                self.alpaca.market_sell(ticker, notional)
-
-        self._last_signal_ts = ts
-
-        # Circuit breaker check after every cycle
-        current_equity = self.alpaca.get_equity()
-        await self.breaker.check(current_equity)
-
-    async def _emergency_shutdown(self) -> None:
-        """Called by the circuit breaker before it trips — cancel and flatten."""
-        logger.warning("Emergency shutdown initiated by Stark Circuit Breaker.")
-        self._running = False
         try:
-            self.alpaca.cancel_all_orders()
-            self.alpaca.close_all_positions()
-        except Exception as exc:
-            logger.error("Emergency shutdown error: %s", exc)
+            await watcher.watch()
+        except CircuitBreakerTripped as exc:
+            logger.critical(
+                "EquityBot halted by circuit breaker — loss=%.2f%% threshold=%.2f%%",
+                exc.loss_pct * 100,
+                exc.threshold * 100,
+            )
+            # Clean exit — positions already closed inside SignalWatcher._process
+        finally:
+            logger.info("Equity Bot stopped.")
 
     def stop(self) -> None:
-        self._running = False
+        """Signal the SignalWatcher loop to exit cleanly after the current poll."""
+        self._stop_flag[0] = True
         logger.info("Equity Bot shutdown requested.")
 
 

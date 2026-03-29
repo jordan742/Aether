@@ -1,10 +1,17 @@
 # Core
 python-dotenv>=1.0.0
 
-# Orbital Gateway
+# Orbital Gateway — Sentinel-2 imagery
 httpx>=0.27.0
 sentinelsat>=1.2.1
 Pillow>=10.0.0
+shapely>=2.0.0
+
+# Orbital Gateway — YOLOv8 ship detection
+ultralytics>=8.2.0
+onnxruntime>=1.18.0
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
 
 # Equity Bot
 alpaca-py>=0.26.0

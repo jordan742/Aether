@@ -1,15 +1,16 @@
 """
-Signal Engine
--------------
-Translates spectral statistics from Sentinel-2 into a directional trading signal.
+Signal Engine — Ship-Count Model
+----------------------------------
+Translates ship-count statistics from YOLOv8 detection into a directional
+trading signal for the port's associated ticker.
 
-Rules (v1 — vegetation stress model):
-  BUY  if NDVI_mean > 0.65 and NDWI_mean > -0.1   (healthy / well-watered crop)
-  SELL if NDVI_mean < 0.35 or  NDWI_mean < -0.2   (stressed / drought risk)
-  HOLD otherwise
+Rules
+    BUY  if ship_count > historical_mean * 1.15   (port congestion → rate spike)
+    SELL if ship_count < historical_mean * 0.85   (slack demand / low traffic)
+    HOLD otherwise
 
-Confidence is a normalised score [0, 1] derived from the NDVI margin above/below
-the threshold and inversely weighted by cloud cover and NDVI standard deviation.
+Signal strength = abs(ship_count - historical_mean) / historical_mean, clamped
+to [0.0, 1.0].
 """
 
 from __future__ import annotations
@@ -17,74 +18,64 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from .sentinel import SpectralStats, SceneMetadata
+from .sentinel import SceneResult
+from .yolo_detector import DetectionResult
 
 Direction = Literal["BUY", "SELL", "HOLD"]
 
-_NDVI_BUY_THRESH = 0.65
-_NDVI_SELL_THRESH = 0.35
-_NDWI_BUY_THRESH = -0.10
-_NDWI_SELL_THRESH = -0.20
+# Historical 30-day mean ship counts per port (vessels observed per scene)
+_HISTORICAL_MEAN: dict[str, float] = {
+    "strait_of_gibraltar": 45.0,
+    "strait_of_hormuz":    38.0,
+    "singapore_strait":    62.0,
+    "english_channel":     55.0,
+}
+
+_BUY_THRESHOLD  = 1.15   # 15 % above baseline
+_SELL_THRESHOLD = 0.85   # 15 % below baseline
 
 
 @dataclass
 class Signal:
     ticker: str
     direction: Direction
-    strength: float  # [0.0, 1.0]
-    anomaly_detected: bool
-    anomaly_type: str | None
-    affected_area_km2: float | None
+    strength: float      # [0.0, 1.0]
+    rationale: str
 
 
-def derive_signal(
-    ticker: str,
-    spectral: SpectralStats,
-    scene: SceneMetadata,
-) -> Signal:
-    """Compute a trading signal from spectral statistics."""
-    ndvi = spectral.ndvi_mean
-    ndwi = spectral.ndwi_mean
-    cloud = scene.cloud_cover_pct / 100.0  # normalise to [0, 1]
+def derive_signal(scene: SceneResult, detection: DetectionResult) -> Signal:
+    """Compute a ship-count-based trading signal.
 
-    # ── Anomaly detection ────────────────────────────────────────────────────
-    anomaly_detected = False
-    anomaly_type: str | None = None
-    affected_area_km2: float | None = None
+    Parameters
+    ----------
+    scene:
+        The ``SceneResult`` produced by ``SentinelFetcher.fetch_latest()``.
+    detection:
+        The ``DetectionResult`` produced by ``ShipDetector.detect()``.
 
-    if ndvi < 0.25 and ndwi < -0.25:
-        anomaly_detected = True
-        anomaly_type = "severe_drought"
-        affected_area_km2 = round(((0.35 - ndvi) / 0.35) * 500, 1)
-    elif ndwi > 0.25:
-        anomaly_detected = True
-        anomaly_type = "flooding"
-        affected_area_km2 = round(ndwi * 200, 1)
-    elif spectral.ndvi_std > 0.15:
-        anomaly_detected = True
-        anomaly_type = "heterogeneous_stress"
-        affected_area_km2 = round(spectral.ndvi_std * 300, 1)
+    Returns
+    -------
+    Signal
+    """
+    hist_mean = _HISTORICAL_MEAN.get(scene.port, 45.0)
+    count = detection.ship_count
 
-    # ── Direction ────────────────────────────────────────────────────────────
-    if ndvi > _NDVI_BUY_THRESH and ndwi > _NDWI_BUY_THRESH:
+    raw_strength = abs(count - hist_mean) / hist_mean if hist_mean > 0 else 0.0
+    strength = round(min(1.0, max(0.0, raw_strength)), 4)
+
+    if count > hist_mean * _BUY_THRESHOLD:
         direction: Direction = "BUY"
-        raw_margin = (ndvi - _NDVI_BUY_THRESH) / (1.0 - _NDVI_BUY_THRESH)
-    elif ndvi < _NDVI_SELL_THRESH or ndwi < _NDWI_SELL_THRESH:
+        rationale = "ship_count_above_30d_avg"
+    elif count < hist_mean * _SELL_THRESHOLD:
         direction = "SELL"
-        raw_margin = (_NDVI_SELL_THRESH - ndvi) / _NDVI_SELL_THRESH if ndvi < _NDVI_SELL_THRESH else 0.5
+        rationale = "ship_count_below_30d_avg"
     else:
         direction = "HOLD"
-        raw_margin = 0.2
-
-    # Reduce confidence for high cloud cover and high spatial variability
-    quality_penalty = cloud * 0.4 + min(spectral.ndvi_std / 0.2, 1.0) * 0.2
-    strength = round(max(0.0, min(1.0, raw_margin - quality_penalty)), 4)
+        rationale = "ship_count_within_30d_avg"
 
     return Signal(
-        ticker=ticker,
+        ticker=scene.ticker,
         direction=direction,
         strength=strength,
-        anomaly_detected=anomaly_detected,
-        anomaly_type=anomaly_type,
-        affected_area_km2=affected_area_km2,
+        rationale=rationale,
     )

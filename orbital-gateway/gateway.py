@@ -2,15 +2,17 @@
 Orbital Gateway
 ---------------
 Main async loop that:
-  1. Fetches the latest Sentinel-2 scene via SentinelFetcher.
-  2. Runs the signal engine to derive a trading direction.
-  3. Packs a ≤1 KB JSON telemetry payload.
-  4. Writes it to the Sovereign Bridge (shared/telemetry.json).
+  1. Fetches the latest Sentinel-2 maritime scene via SentinelFetcher.
+  2. Runs quantized YOLOv8 ship-count inference via ShipDetector.
+  3. Derives a directional trading signal via signal_engine.derive_signal().
+  4. Builds a ≤1 KB JSON telemetry payload matching schema v2.0.0.
+  5. Writes it to the Sovereign Bridge (shared/telemetry.json).
 
 Run directly:
     python -m orbital-gateway
 
-Or import OrbitalGateway and call await gateway.run() inside your own event loop.
+Or import OrbitalGateway and call ``await gateway.run()`` inside your own
+event loop.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ load_dotenv()
 
 from shared.bridge import TelemetryBridge
 from .sentinel import SentinelFetcher
+from .yolo_detector import ShipDetector
 from .signal_engine import derive_signal
 
 logger = logging.getLogger(__name__)
@@ -39,25 +42,29 @@ logging.basicConfig(
 )
 
 _DEFAULT_INTERVAL = int(os.getenv("TELEMETRY_INTERVAL", "60"))
+_DEFAULT_PORT     = os.getenv("ORBITAL_PORT", "strait_of_gibraltar")
 
 
 class OrbitalGateway:
-    """Edge AI simulator — polls Sentinel-2 and writes telemetry to the bridge."""
+    """Edge AI simulator — polls Sentinel-2 and writes ship-count telemetry."""
 
     def __init__(
         self,
+        port: str = _DEFAULT_PORT,
         interval: int = _DEFAULT_INTERVAL,
         bridge: TelemetryBridge | None = None,
     ) -> None:
         self.interval = interval
-        self.bridge = bridge or TelemetryBridge()
-        self._fetcher = SentinelFetcher()
-        self._running = False
+        self.bridge   = bridge or TelemetryBridge()
+        self._fetcher = SentinelFetcher(port=port)           # type: ignore[arg-type]
+        self._detector = ShipDetector(port=port)
+        self._running  = False
 
     async def run(self) -> None:
         """Start the continuous telemetry update loop."""
         self._running = True
-        logger.info("Orbital Gateway online — interval=%ds", self.interval)
+        logger.info("Orbital Gateway online — port=%s interval=%ds",
+                    self._fetcher.port, self.interval)
 
         while self._running:
             try:
@@ -67,44 +74,51 @@ class OrbitalGateway:
             await asyncio.sleep(self.interval)
 
     async def _tick(self) -> None:
-        """Fetch imagery, derive signal, write bridge."""
-        result = await self._fetcher.fetch_latest()
-        signal = derive_signal(result.ticker, result.spectral, result.scene)
+        """Fetch scene, detect ships, derive signal, write bridge payload."""
+        # 1. Fetch latest Sentinel-2 scene for the configured port
+        scene = await self._fetcher.fetch_latest()
 
+        # 2. Run YOLOv8 ship detection (simulation when no image on disk)
+        detection = self._detector.detect(scene.image_path)
+
+        # 3. Derive trading signal from ship count vs. historical baseline
+        signal = derive_signal(scene, detection)
+
+        # 4. Build schema v2.0.0 payload (timestamp injected by bridge.write)
         payload: dict = {
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "source": "orbital-gateway",
             "scene": {
-                "tile_id": result.scene.tile_id,
-                "acquisition_date": result.scene.acquisition_date,
-                "cloud_cover_pct": result.scene.cloud_cover_pct,
-                "bbox": result.scene.bbox,
+                "tile_id":          scene.tile_id,
+                "acquisition_date": scene.acquisition_date,
+                "cloud_cover_pct":  scene.cloud_cover_pct,
+                "bbox":             scene.bbox,
+                "port":             scene.port,
             },
-            "spectral": {
-                "ndvi_mean": result.spectral.ndvi_mean,
-                "ndvi_std": result.spectral.ndvi_std,
-                "ndwi_mean": result.spectral.ndwi_mean,
-                "evi_mean": result.spectral.evi_mean,
-            },
-            "anomaly": {
-                "detected": signal.anomaly_detected,
-                "type": signal.anomaly_type,
-                "confidence": signal.strength if signal.anomaly_detected else None,
-                "affected_area_km2": signal.affected_area_km2,
+            "detection": {
+                "model":           "yolov8n-ship",
+                "ship_count":      detection.ship_count,
+                "confidence_mean": detection.confidence_mean,
+                "large_vessels":   detection.large_vessels,
+                "small_vessels":   detection.small_vessels,
+                "inference_ms":    detection.inference_ms,
             },
             "signal": {
-                "ticker": signal.ticker,
+                "ticker":    signal.ticker,
                 "direction": signal.direction,
-                "strength": signal.strength,
+                "strength":  signal.strength,
+                "rationale": signal.rationale,
             },
             "status": "active",
         }
 
+        # 5. Atomic write to shared/telemetry.json (bridge stamps timestamp)
         await self.bridge.write(payload)
         logger.info(
-            "Telemetry written — tile=%s NDVI=%.3f signal=%s(%.2f)",
-            result.scene.tile_id,
-            result.spectral.ndvi_mean,
+            "Telemetry written — port=%s tile=%s ships=%d signal=%s(%.2f)",
+            scene.port,
+            scene.tile_id,
+            detection.ship_count,
             signal.direction,
             signal.strength,
         )

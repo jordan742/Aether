@@ -1,29 +1,27 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "source": "orbital-gateway",
   "timestamp": null,
   "scene": {
     "tile_id": null,
     "acquisition_date": null,
     "cloud_cover_pct": null,
-    "bbox": null
+    "bbox": null,
+    "port": null
   },
-  "spectral": {
-    "ndvi_mean": null,
-    "ndvi_std": null,
-    "ndwi_mean": null,
-    "evi_mean": null
-  },
-  "anomaly": {
-    "detected": false,
-    "type": null,
-    "confidence": null,
-    "affected_area_km2": null
+  "detection": {
+    "model": "yolov8n-ship",
+    "ship_count": null,
+    "confidence_mean": null,
+    "large_vessels": null,
+    "small_vessels": null,
+    "inference_ms": null
   },
   "signal": {
     "ticker": null,
     "direction": null,
-    "strength": null
+    "strength": null,
+    "rationale": null
   },
   "status": "initializing"
 }

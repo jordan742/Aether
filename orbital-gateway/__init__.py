@@ -1,4 +1,6 @@
-"""Orbital Gateway — Edge AI simulator for Sentinel-2 satellite imagery."""
-from .gateway import OrbitalGateway
+"""Orbital Gateway — maritime ship-count satellite intelligence for Aether Fund One."""
 
-__all__ = ["OrbitalGateway"]
+from .gateway import OrbitalGateway
+from .yolo_detector import ShipDetector
+
+__all__ = ["OrbitalGateway", "ShipDetector"]

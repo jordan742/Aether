@@ -1,24 +1,22 @@
 """
 Stark Circuit Breaker
 ---------------------
-Monitors intraday P&L and auto-kills all active processes when the daily loss
+Monitors intraday P&L and auto-kills the trading loop when the daily loss
 exceeds the configured threshold (default: 2 %).
 
 Named after Tony Stark's suit failsafe — it kicks in before catastrophic failure.
 
 Usage:
     breaker = StarkCircuitBreaker(threshold=0.02)
-    await breaker.check(portfolio_value=100_000, starting_value=102_000)
+    await breaker.initialise(starting_equity=100_000.0)
+    await breaker.check(current_equity=97_000.0)
     # raises CircuitBreakerTripped if loss >= 2%
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import signal as _signal
-import sys
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -64,7 +62,7 @@ class DailySnapshot:
 
 
 class StarkCircuitBreaker:
-    """Intraday loss guard that terminates the trading process on breach."""
+    """Intraday loss guard that raises CircuitBreakerTripped on breach."""
 
     def __init__(self, threshold: float = _DEFAULT_THRESHOLD) -> None:
         self.threshold = threshold
@@ -72,7 +70,7 @@ class StarkCircuitBreaker:
         self._callbacks: list = []
 
     def register_shutdown_callback(self, coro_func) -> None:
-        """Register an async callback to call before process kill."""
+        """Register an async callback to call before the breaker trips."""
         self._callbacks.append(coro_func)
 
     async def initialise(self, starting_equity: float) -> None:
@@ -98,7 +96,7 @@ class StarkCircuitBreaker:
 
         today = date.today()
         if self._snapshot.date != today:
-            # New trading day — re-arm
+            # New trading day — re-arm automatically
             await self.initialise(current_equity)
             return
 
@@ -115,7 +113,6 @@ class StarkCircuitBreaker:
             self.threshold * 100,
         )
 
-        # Run registered shutdown hooks (e.g. cancel all orders)
         for cb in self._callbacks:
             try:
                 await cb()
