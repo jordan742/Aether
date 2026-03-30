@@ -187,7 +187,7 @@ def _pressure_html(report: TrendReport) -> str:
     """
     if report.pressure_flag:
         css         = "pressure-active"
-        label       = "⚠  SUPPLY PRESSURE — GATE ACTIVE"
+        label       = "⚠  SUPPLY SIDE PRESSURE — GATE ACTIVE"
         label_color = "#FFB800"
     else:
         css         = "pressure-inactive"
@@ -276,7 +276,7 @@ def _equity_card_html(snap: EquitySnapshot) -> str:
 # ── Display constants ──────────────────────────────────────────────────────────
 
 SUPPLY_WINDOW     = 30       # must match shared/intelligence.py
-PRESSURE_GATE_PCT = 15       # must match shared/intelligence.py (PRESSURE_GATE * 100)
+PRESSURE_GATE_PCT = 10       # must match shared/intelligence.py (PRESSURE_GATE * 100)
 AOI_LABEL         = "Strait of Gibraltar [35.9°N, 5.3°W]"
 
 
@@ -350,6 +350,54 @@ while True:
         st.markdown("**📊 Supply Analysis**")
         for bullet in report.sidebar_bullets:
             st.markdown(f"- {bullet}")
+
+        # ── Strategic Valuation Brief ────────────────────────────────────────
+        st.divider()
+        st.markdown("**📋 Strategic Valuation Brief**")
+
+        if report.pressure_flag:
+            thesis_color = "#FFB800"
+            thesis_badge = "🔴 ACTIVE"
+            xom_delta = (
+                f"+{report.xom.projected_delta_pct:.1%}"
+                if report.xom and report.xom.projected_delta_pct is not None
+                else "N/A"
+            )
+            uso_delta = (
+                f"+{report.uso.projected_delta_pct:.1%}"
+                if report.uso and report.uso.projected_delta_pct is not None
+                else "N/A"
+            )
+            st.markdown(f"""
+**Supply Side Pressure Thesis** &nbsp; `{thesis_badge}`
+
+> Elevated inward tanker throughput at the Strait of Gibraltar exceeds the
+> {SUPPLY_WINDOW}-observation Supply Index by more than **{PRESSURE_GATE_PCT}%**,
+> activating the Supply Side Pressure thesis.
+
+**Projected Valuation Impact**
+
+| Instrument | Corr. *r* | Projected Δ |
+|:-----------|:---------:|------------:|
+| `$XOM`     |   0.32    | **{xom_delta}** |
+| `$USO`     |   0.38    | **{uso_delta}** |
+
+*Linear elasticity model: Δ price% ≈ transit deviation% × correlation coefficient.
+Reference frame only — not investment advice.*
+""")
+        else:
+            st.markdown(f"""
+**Supply Side Pressure Thesis** &nbsp; `🟢 INACTIVE`
+
+> Inward transit volume at the Strait of Gibraltar is within the normal
+> variance band (±{PRESSURE_GATE_PCT}% of Supply Index). No directional
+> bias detected at current observation frequency.
+
+**Coverage Universe:** `$XOM` · `$USO`
+
+*Monitor for deviation beyond the {PRESSURE_GATE_PCT}% threshold to
+activate the Supply Side Pressure thesis.*
+""")
 
         # ── Configuration panel ──────────────────────────────────────────────
         st.divider()

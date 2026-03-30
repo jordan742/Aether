@@ -98,9 +98,9 @@ CLOUD_COVERAGE_LIMIT   = 0.30  # scene fraction; above → LOW confidence
 
 # ── Storage paths ────────────────────────────────────────────────────────────────
 
-_ROOT    = Path(__file__).resolve().parent  # project root (Aether/)
+_ROOT    = Path(os.path.dirname(os.path.abspath(__file__)))  # project root (Aether/)
 DATA_DIR = _ROOT / "data"
-CSV_PATH = DATA_DIR / "energy_flow.csv"
+CSV_PATH = Path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "energy_flow.csv"))
 
 _CSV_FIELDS = [
     "timestamp", "tanker_count", "confidence_score",

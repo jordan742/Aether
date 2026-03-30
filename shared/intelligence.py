@@ -58,9 +58,9 @@ CSV_PATH = _ROOT / "data" / "energy_flow.csv"
 # In development (minute-level cadence): adjust SUPPLY_WINDOW accordingly.
 SUPPLY_WINDOW  = 30
 
-# Supply Pressure gate: transit volume must exceed the Supply Index by this
-# fraction before generating a "Supply Pressure" insight.
-PRESSURE_GATE  = 0.15  # 15 % above baseline
+# Supply Side Pressure gate: transit volume must exceed the Supply Index by this
+# fraction before generating a "Supply Side Pressure" insight.
+PRESSURE_GATE  = 0.10  # 10 % above baseline — institutional-grade sensitivity
 
 # Equity correlation coefficients (shipping-volume → equity-price, Pearson r)
 # Derived from 5-year rolling back-test vs. Gibraltar weekly transit records.
@@ -190,13 +190,14 @@ def _build_transit_narrative(
             f"Inward transit volume is {pct:.0f}% {dir_word} the "
             f"{SUPPLY_WINDOW}-observation Supply Index "
             f"({current} VLCC/Suezmax transits observed vs. {idx:.1f} baseline). "
-            f"Supply-side volatility confirmed at the Gibraltar chokepoint."
+            f"Supply Side Pressure confirmed — elevated throughput at the Gibraltar chokepoint "
+            f"signals potential crude inventory draw-down."
         )
     return (
         f"Inward transit volume is {pct:.0f}% {dir_word} the "
         f"{SUPPLY_WINDOW}-observation Supply Index "
         f"({current} transits vs. {idx:.1f} baseline). "
-        f"Flow within normal variance — no directional bias detected."
+        f"Flow within normal variance band — no actionable directional bias detected."
     )
 
 
@@ -218,21 +219,28 @@ def _build_supply_insight(
 
     if pressure and (deviation or 0) > 0:
         return (
-            "Supply-side pressure confirmed — elevated inward tanker flow at Gibraltar "
-            "historically precedes WTI crude inventory draw-down events and near-term "
-            "upstream earnings acceleration. Recommend increased Energy sector visibility "
-            f"($XOM, $USO).{conf_caveat}"
+            "**Supply Side Pressure thesis active.** "
+            "Elevated inward tanker throughput at the Strait of Gibraltar constitutes a "
+            "high-conviction leading indicator of WTI crude inventory draw-down events. "
+            "Historical back-tests correlate this signal with near-term upstream earnings "
+            "acceleration and Energy sector outperformance. "
+            "Recommend overweight Energy sector positioning with directional exposure "
+            f"to $XOM (upstream leverage) and $USO (crude ETF delta).{conf_caveat}"
         )
     if pressure and (deviation or 0) < 0:
         return (
-            "Supply-side relief signal detected — below-baseline inward transit volume "
-            "suggests potential crude inventory build-up, consistent with margin "
-            f"compression in the Energy sector.{conf_caveat}"
+            "**Supply Side Pressure thesis inverted — bearish crude signal.** "
+            "Below-baseline inward transit volume at Gibraltar suggests an emergent crude "
+            "inventory build-up cycle, historically consistent with near-term WTI price "
+            "compression and Energy sector margin deterioration. "
+            "Consider reducing upstream Energy exposure pending confirmation "
+            f"at subsequent observation intervals.{conf_caveat}"
         )
     return (
-        "Inward transit volume within normal variance band at Strait of Gibraltar. "
-        "No actionable supply disruption signal detected at current observation "
-        f"frequency.{conf_caveat}"
+        "Inward transit volume within the normal variance band at the Strait of Gibraltar. "
+        "No actionable Supply Side Pressure signal detected at current observation frequency. "
+        "Maintain neutral Energy sector positioning — monitor for deviation beyond the "
+        f"10% Supply Index threshold before adjusting directional bias.{conf_caveat}"
     )
 
 
@@ -260,13 +268,13 @@ def _build_sidebar_bullets(
         )
 
     if pressure:
-        bullets.append("🔴 **Supply Pressure gate active** — threshold exceeded (>15%)")
+        bullets.append("🔴 **Supply Side Pressure gate active** — threshold exceeded (>10%)")
         bullets.append("⚡ Crude supply-chain tightening at Gibraltar chokepoint")
         bullets.append("🛢️  Linked instruments under coverage: `$XOM`  `$USO`")
     else:
         bullets.append(
-            "🟢 Inward transit volume within Supply Index variance — "
-            "no directional energy bias detected"
+            "🟢 Inward transit volume within Supply Index variance band — "
+            "no actionable directional energy bias detected"
         )
 
     # Confidence / cloud gate status
