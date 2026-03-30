@@ -1,10 +1,23 @@
-# ── Aether Intelligence — Streamlit Cloud requirements ────────────────────────
-# Minimum set required for dashboard.py + shared/intelligence.py.
-# All heavy orbital-gateway deps (ultralytics, onnxruntime, sentinelsat) are
-# excluded here — they run locally only and are not needed for the Cloud UI.
+# ── Aether: Mediterranean Energy Intelligence ─────────────────────────────────
+# Streamlit Cloud deployment requirements.
+# Split into two tiers:
+#   CORE   — needed by dashboard.py + shared/intelligence.py (Cloud-safe)
+#   LOCAL  — needed by orion_feed.py + orion_loop.py (run locally or on a VM)
+#
+# Streamlit Cloud only installs this file. orion_feed.py is not executed there,
+# so the LOCAL tier packages are included but will only be actively used when
+# the pipeline runs on a machine with network access to the Copernicus API.
+# All packages are pip-installable with no system-level build deps.
 
+# ── CORE: dashboard + intelligence engine ──────────────────────────────────────
 streamlit>=1.35.0
 pandas>=2.2.0
-cryptography>=42.0.0
 yfinance>=0.2.40
+cryptography>=42.0.0
 python-dotenv>=1.0.0
+
+# ── LOCAL: Orion feed — Sentinel-2 acquisition + OpenCV detection ──────────────
+numpy>=1.26.0
+opencv-python-headless>=4.10.0   # headless: no GUI deps; safe for server / Cloud
+sentinelsat>=1.2.1                # Copernicus Open Access Hub client
+shapely>=2.0.0                    # AOI geometry (WKT bounding box for Sentinel query)
