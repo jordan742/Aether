@@ -1,326 +1,421 @@
 """
-shared/intelligence.py — Aether Intelligence Engine
-------------------------------------------------------
-Stateless analytics layer.  Takes ship count observations and returns:
-  - trend_label          Human-readable trend narrative
-  - recommendation       Sector / action recommendation
-  - insight_category     BULLISH | BEARISH | NEUTRAL | WATCH
-  - ship_series          pd.DataFrame for the Satellite Trend line chart
-  - xom_series           pd.DataFrame of recent XOM closing prices
-  - insights             Bullet list for the Strategic Insights sidebar
+shared/intelligence.py — Aether Energy Arbitrage Intelligence Engine
+======================================================================
+Reads data/energy_flow.csv (written by orion_feed.py) and produces a
+fully-populated TrendReport consumed by dashboard.py.
 
-No file I/O, no subprocess calls — safe for Streamlit Cloud.
+Analytics produced
+------------------
+Supply Index        30-observation rolling mean of inward tanker transit
+                    volume — the proprietary baseline for the Gibraltar
+                    chokepoint.
+
+Supply Pressure     Boolean gate that fires when current transit volume
+                    deviates > PRESSURE_GATE (15 %) above the Supply Index.
+                    Analogous to a z-score trigger in quantitative strategies.
+
+Valuation Impact    When the gate fires, computes a Projected Value Delta
+                    for $XOM and $USO using a linear elasticity model:
+                        price_Δ% ≈ transit_deviation% × shipping→price_corr
+                    Correlation coefficients are derived from a 5-year
+                    rolling Pearson r between Gibraltar tanker density and
+                    weekly equity closing prices (indicative; not advice).
+
+Professional terminology
+------------------------
+All narratives use buy-side investment-management language:
+  "Inward transit volume"   — vessel throughput (not "ship count")
+  "Supply Index"            — rolling baseline (not "average")
+  "Supply-side volatility"  — elevated flow variance
+  "Inventory draw-down"     — crude stock depletion event
+  "Directional bias"        — non-neutral signal
+
+Dependencies: numpy, pandas, yfinance (no heavy ML required).
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
+import numpy as np  # noqa: F401  (available; used implicitly by pandas)
 import pandas as pd
 import yfinance as yf
 
+log = logging.getLogger(__name__)
 
-# ── Valuation Impact ────────────────────────────────────────────────────────────
+# shared/intelligence.py lives at  Aether/shared/intelligence.py
+# Data CSV lives at                Aether/data/energy_flow.csv
+_ROOT    = Path(__file__).resolve().parent.parent  # → Aether/
+CSV_PATH = _ROOT / "data" / "energy_flow.csv"
+
+# ── Supply analysis parameters ──────────────────────────────────────────────────
+
+# Rolling window for the 30-observation Supply Index.
+# In production (hourly Orion cadence): 30 obs ≈ 30 hours of intraday data.
+# In development (minute-level cadence): adjust SUPPLY_WINDOW accordingly.
+SUPPLY_WINDOW  = 30
+
+# Supply Pressure gate: transit volume must exceed the Supply Index by this
+# fraction before generating a "Supply Pressure" insight.
+PRESSURE_GATE  = 0.15  # 15 % above baseline
+
+# Equity correlation coefficients (shipping-volume → equity-price, Pearson r)
+# Derived from 5-year rolling back-test vs. Gibraltar weekly transit records.
+# XOM: crude tanker density → ExxonMobil upstream earnings sensitivity
+# USO: crude tanker density → crude oil ETF (USO) price sensitivity
+XOM_CORR = 0.32
+USO_CORR = 0.38
+
+
+# ── Report dataclasses ──────────────────────────────────────────────────────────
 
 @dataclass
-class ValuationImpact:
+class EquitySnapshot:
     """
-    Fundamental snapshot + projected price delta for the linked ticker.
-    Only ``triggered=True`` when ship congestion is > 10 % above baseline.
+    Real-time fundamental snapshot + projected Supply Pressure impact
+    for a single linked equity instrument.
     """
     ticker:              str
-    current_price:       Optional[float]
-    market_cap:          Optional[float]   # USD, raw
-    pe_ratio:            Optional[float]
-    projected_delta_pct: Optional[float]   # e.g. 0.042 → +4.2 %
+    last_close:          Optional[float]   # USD, last traded price
+    market_cap:          Optional[float]   # USD, raw value
+    pe_ratio:            Optional[float]   # trailing P/E (yfinance trailingPE)
+    correlation_coeff:   float             # shipping→price Pearson r
+    # Populated only when the Supply Pressure gate is active
+    projected_delta_pct: Optional[float]   # e.g. 0.048 → +4.8 %
     projected_delta_usd: Optional[float]   # absolute price move estimate
-    correlation_coeff:   float             # shipping-volume → price correlation used
-    triggered:           bool              # True only when delta_vs_baseline > 0.10
+    pressure_triggered:  bool             # True when deviation > PRESSURE_GATE
 
-
-# Historical shipping-volume → equity-price correlation coefficients.
-# Derived from 5-year rolling Pearson r between chokepoint vessel counts
-# and weekly closing prices (internal back-test, indicative only).
-_SHIPPING_PRICE_CORR: dict[str, float] = {
-    "XOM":  0.32,   # crude tanker density → energy sector earnings
-    "CVX":  0.30,   # similar crude exposure
-    "USO":  0.38,   # crude oil ETF — tighter link to tanker flow
-    "OIH":  0.35,   # oilfield services
-    "BDRY": 0.58,   # Baltic Dry ETF — near-direct shipping proxy
-    "BHP":  0.45,   # bulk commodity mining
-    "RIO":  0.42,
-    "ZIM":  0.41,   # container shipping — direct relationship
-    "MATX": 0.38,
-    "SOXS": -0.28,  # semiconductor supply-chain inverse ETF
-}
-_DEFAULT_CORR = 0.25  # fallback for unmapped tickers
-
-
-def _fetch_valuation(ticker: str, delta_vs_baseline: Optional[float]) -> ValuationImpact:
-    """
-    Pull Market Cap and P/E from yfinance ``fast_info`` / ``info``.
-    If ship congestion > 10 % above baseline, compute Projected Value Delta.
-    """
-    clean = ticker.strip().lstrip("$") if ticker and ticker != "—" else ""
-
-    current_price: Optional[float] = None
-    market_cap:    Optional[float] = None
-    pe_ratio:      Optional[float] = None
-
-    if clean:
-        try:
-            yf_ticker = yf.Ticker(clean)
-            fi = yf_ticker.fast_info            # lightweight; avoids heavy info call
-
-            current_price = float(fi.last_price)           if hasattr(fi, "last_price")            and fi.last_price  else None
-            market_cap    = float(fi.market_cap)            if hasattr(fi, "market_cap")            and fi.market_cap  else None
-
-            # P/E is not in fast_info — pull from info dict (cached by yfinance)
-            info          = yf_ticker.info
-            pe_raw        = info.get("trailingPE") or info.get("forwardPE")
-            pe_ratio      = float(pe_raw) if pe_raw else None
-        except Exception:
-            pass
-
-    corr = _SHIPPING_PRICE_CORR.get(clean, _DEFAULT_CORR)
-    triggered = (delta_vs_baseline is not None) and (delta_vs_baseline > 0.10)
-
-    projected_delta_pct: Optional[float] = None
-    projected_delta_usd: Optional[float] = None
-
-    if triggered and delta_vs_baseline is not None:
-        # Linear elasticity model:
-        #   price_Δ% ≈ shipping_deviation% × correlation_coefficient
-        projected_delta_pct = delta_vs_baseline * corr
-        if current_price is not None:
-            projected_delta_usd = current_price * projected_delta_pct
-
-    return ValuationImpact(
-        ticker=clean or "—",
-        current_price=current_price,
-        market_cap=market_cap,
-        pe_ratio=pe_ratio,
-        projected_delta_pct=projected_delta_pct,
-        projected_delta_usd=projected_delta_usd,
-        correlation_coeff=corr,
-        triggered=triggered,
-    )
-
-
-# ── Output dataclass ────────────────────────────────────────────────────────────
 
 @dataclass
 class TrendReport:
-    trend_label:        str
-    recommendation:     str
-    insight_category:   str                # BULLISH | BEARISH | NEUTRAL | WATCH
-    delta_vs_baseline:  Optional[float]    # e.g. 0.15 → +15 %
-    current_count:      Optional[int]
-    baseline_count:     Optional[float]
-    dominant_type:      str
-    ship_series:        pd.DataFrame       # index=timestamp, col=ship_count
-    xom_series:         pd.DataFrame       # cols=[Date, Close]
-    valuation:          Optional[ValuationImpact] = None
-    insights:           list[str] = field(default_factory=list)
+    """
+    Complete energy intelligence report for one dashboard render cycle.
+    All fields are safe to read in Streamlit (no lazy generators).
+
+    Field naming convention follows buy-side research standards.
+    """
+    # ── Supply analytics ────────────────────────────────────────────────────
+    supply_index:       Optional[float]  # 30-obs rolling mean transit volume
+    deviation_pct:      Optional[float]  # (current − index) / index
+    pressure_flag:      bool             # True → Supply Pressure active
+
+    # ── Human-readable intelligence (investment-management tone) ────────────
+    inward_transit_vol: str  # e.g. "Inward transit volume 17% above Supply Index…"
+    supply_insight:     str  # Single investment-grade sentence
+    sidebar_bullets:    list[str] = field(default_factory=list)
+
+    # ── Time series for line chart ──────────────────────────────────────────
+    # Indexed by UTC timestamp; column: "tanker_count"
+    flow_series:        pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # ── Orion signal quality ────────────────────────────────────────────────
+    confidence_latest:  float = 1.0   # most recent confidence_score from Orion
+
+    # ── Equity snapshots ────────────────────────────────────────────────────
+    xom: Optional[EquitySnapshot] = None
+    uso: Optional[EquitySnapshot] = None
 
 
-# ── Vessel-type → sector recommendation map ────────────────────────────────────
+# ── CSV data loader ─────────────────────────────────────────────────────────────
 
-_RECO: dict[str, dict[str, tuple[str, str]]] = {
-    "tanker": {
-        "up":   ("BULLISH",
-                 "Energy supply pressure detected — crude tanker congestion at chokepoint. "
-                 "Consider Energy sector exposure ($XOM, $USO, $OIH)."),
-        "down": ("BEARISH",
-                 "Tanker flow easing — potential crude supply relief. "
-                 "Energy sector headwinds likely near-term."),
-        "flat": ("NEUTRAL",
-                 "Tanker flow stable — no directional energy signal detected. "
-                 "Hold existing Energy positions."),
-    },
-    "bulk_carrier": {
-        "up":   ("BULLISH",
-                 "Bulk carrier surge detected — commodity demand expansion signal. "
-                 "Monitor Baltic Dry Index and mining equities ($BDRY, $BHP)."),
-        "down": ("BEARISH",
-                 "Bulk carrier decline — commodity demand softening. "
-                 "Defensive positioning in materials sector warranted."),
-        "flat": ("WATCH",
-                 "Bulk carrier flow neutral — await volume confirmation before positioning."),
-    },
-    "container": {
-        "up":   ("BULLISH",
-                 "Container ship acceleration — global trade flow expansion confirmed. "
-                 "Consider logistics and shipping exposure ($ZIM, $MATX)."),
-        "down": ("BEARISH",
-                 "Container traffic contracting — supply chain tightening signal. "
-                 "Monitor tech and retail margin compression."),
-        "flat": ("NEUTRAL",
-                 "Container throughput stable — no macro disruption signal detected."),
-    },
-    "unknown": {
-        "up":   ("WATCH",  "Vessel activity increasing — type classification pending. Monitor chokepoint."),
-        "down": ("WATCH",  "Vessel activity declining — insufficient data for sector mapping."),
-        "flat": ("NEUTRAL","Vessel activity nominal. Awaiting classification data."),
-    },
-}
+def _load_flow() -> pd.DataFrame:
+    """
+    Read data/energy_flow.csv and return a clean, sorted DataFrame.
+
+    Columns guaranteed in output:
+        timestamp       datetime64[UTC]
+        tanker_count    int
+        confidence_score float ∈ [0, 1]
+        cloud_flag      bool
+
+    Returns an empty DataFrame (with correct schema) when the file does
+    not yet exist — dashboard handles this gracefully.
+    """
+    empty = pd.DataFrame(
+        columns=["timestamp", "tanker_count", "confidence_score", "cloud_flag"]
+    )
+    if not CSV_PATH.exists():
+        return empty
+
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception as exc:
+        log.warning("Could not read energy_flow.csv: %s", exc)
+        return empty
+
+    df["timestamp"]        = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["tanker_count"]     = pd.to_numeric(df["tanker_count"],     errors="coerce").fillna(0).astype(int)
+    df["confidence_score"] = pd.to_numeric(df["confidence_score"], errors="coerce").fillna(0.5)
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df
 
 
-# ── Internal helpers ────────────────────────────────────────────────────────────
+# ── Supply analytics ─────────────────────────────────────────────────────────────
 
-def _direction(delta: Optional[float]) -> str:
-    if delta is None:
-        return "flat"
-    return "up" if delta > 0.05 else "down" if delta < -0.05 else "flat"
+def _supply_index(df: pd.DataFrame) -> Optional[float]:
+    """
+    30-observation rolling mean of inward transit volume.
+    Returns None when fewer than 3 observations are available
+    (insufficient data to establish a credible baseline).
+    """
+    counts = df["tanker_count"].dropna()
+    if len(counts) < 3:
+        return None
+    return float(counts.iloc[-SUPPLY_WINDOW:].mean())
 
 
-def _trend_label(
-    dominant_type: str,
-    delta: Optional[float],
-    current: Optional[int],
-    baseline: Optional[float],
-    direction: str,
-    port: str,
+# ── Narrative builders (buy-side terminology) ────────────────────────────────────
+
+def _build_transit_narrative(
+    current: int,
+    idx: Optional[float],
+    deviation: Optional[float],
+    pressure: bool,
 ) -> str:
-    port_name  = port.replace("_", " ").title() if port else "chokepoint"
-    type_label = dominant_type.replace("_", " ") if dominant_type else "vessel"
+    """Returns a professional transit-volume sentence."""
+    if idx is None:
+        return (
+            "Accumulating Supply Index baseline at Strait of Gibraltar — "
+            "insufficient inward transit observations to establish directional bias."
+        )
 
-    if delta is None or baseline is None:
-        return f"Accumulating orbital baseline at {port_name}… (need ≥ 3 observations)"
+    pct      = abs(deviation or 0) * 100
+    dir_word = "above" if (deviation or 0) > 0 else "below"
 
-    pct      = abs(delta) * 100
-    dir_word = "above" if direction == "up" else "below" if direction == "down" else "at"
+    if pressure:
+        return (
+            f"Inward transit volume is {pct:.0f}% {dir_word} the "
+            f"{SUPPLY_WINDOW}-observation Supply Index "
+            f"({current} VLCC/Suezmax transits observed vs. {idx:.1f} baseline). "
+            f"Supply-side volatility confirmed at the Gibraltar chokepoint."
+        )
     return (
-        f"Inward {type_label} flow is {pct:.0f}% {dir_word} 30-observation baseline "
-        f"at {port_name}  ({current} ships observed vs {baseline:.0f} avg)"
+        f"Inward transit volume is {pct:.0f}% {dir_word} the "
+        f"{SUPPLY_WINDOW}-observation Supply Index "
+        f"({current} transits vs. {idx:.1f} baseline). "
+        f"Flow within normal variance — no directional bias detected."
     )
 
 
-def _build_insights(
-    dominant_type: str,
-    direction: str,
-    delta: Optional[float],
-    current: Optional[int],
-    port: str,
+def _build_supply_insight(
+    pressure: bool,
+    deviation: Optional[float],
+    confidence: float,
+) -> str:
+    """Returns one investment-grade insight sentence."""
+    # Append low-confidence caveat when cloud cover attenuated the acquisition
+    conf_caveat = (
+        " Note: low-confidence acquisition (cloud cover > 30%) — "
+        "signal weight reduced pending atmospheric clearance."
+        if confidence < 0.50 else ""
+    )
+
+    if deviation is None:
+        return f"Insufficient inward transit data to derive energy supply signal.{conf_caveat}"
+
+    if pressure and (deviation or 0) > 0:
+        return (
+            "Supply-side pressure confirmed — elevated inward tanker flow at Gibraltar "
+            "historically precedes WTI crude inventory draw-down events and near-term "
+            "upstream earnings acceleration. Recommend increased Energy sector visibility "
+            f"($XOM, $USO).{conf_caveat}"
+        )
+    if pressure and (deviation or 0) < 0:
+        return (
+            "Supply-side relief signal detected — below-baseline inward transit volume "
+            "suggests potential crude inventory build-up, consistent with margin "
+            f"compression in the Energy sector.{conf_caveat}"
+        )
+    return (
+        "Inward transit volume within normal variance band at Strait of Gibraltar. "
+        "No actionable supply disruption signal detected at current observation "
+        f"frequency.{conf_caveat}"
+    )
+
+
+def _build_sidebar_bullets(
+    current:   Optional[int],
+    idx:       Optional[float],
+    deviation: Optional[float],
+    pressure:  bool,
+    confidence: float,
 ) -> list[str]:
-    port_name = port.replace("_", " ").title() if port else "chokepoint"
-    out: list[str] = []
+    """Returns a list of markdown strings for the sidebar supply analysis panel."""
+    bullets: list[str] = []
 
-    if delta is not None:
-        pct    = abs(delta) * 100
-        symbol = "▲" if direction == "up" else "▼" if direction == "down" else "→"
-        out.append(f"{symbol} **{pct:.0f}% flow deviation** at {port_name}")
+    if deviation is not None:
+        pct    = abs(deviation) * 100
+        symbol = "▲" if deviation > 0 else "▼" if deviation < 0 else "→"
+        bullets.append(
+            f"{symbol} **{pct:.0f}% inward transit deviation** vs. {SUPPLY_WINDOW}-obs Supply Index"
+        )
 
-    if dominant_type == "tanker":
-        out.append("⚡ **Energy correlation**: crude tanker density → WTI price pressure")
-        out.append("🛢️  Watch: `$XOM` `$CVX` `$USO` `$OIH`")
-    elif dominant_type == "bulk_carrier":
-        out.append("⚓ **Commodity demand**: bulk carrier surge → iron ore / coal flow")
-        out.append("📦 Watch: `$BDRY` `$BHP` `$RIO`")
-    elif dominant_type == "container":
-        out.append("🏭 **Trade flow signal**: container throughput → global supply chain health")
-        out.append("🚢 Watch: `$ZIM` `$MATX` `$SOXS`")
+    if idx is not None:
+        bullets.append(
+            f"📊 Supply Index: **{idx:.1f} transits/obs** "
+            f"({SUPPLY_WINDOW}-observation rolling mean)"
+        )
 
-    if current is not None:
-        if current > 20:
-            out.append(f"🔴 **Anomalous traffic**: {current} vessels in AOI — high-density event")
-        elif current > 10:
-            out.append(f"🟡 Moderate traffic: {current} vessels — elevated but within normal range")
-        else:
-            out.append(f"🟢 Normal traffic: {current} vessels in AOI")
+    if pressure:
+        bullets.append("🔴 **Supply Pressure gate active** — threshold exceeded (>15%)")
+        bullets.append("⚡ Crude supply-chain tightening at Gibraltar chokepoint")
+        bullets.append("🛢️  Linked instruments under coverage: `$XOM`  `$USO`")
+    else:
+        bullets.append(
+            "🟢 Inward transit volume within Supply Index variance — "
+            "no directional energy bias detected"
+        )
 
-    return out
+    # Confidence / cloud gate status
+    if confidence < 0.50:
+        bullets.append(
+            f"⚠️  **Low-confidence observation** ({confidence:.0%}) — "
+            "atmospheric cloud cover attenuated signal"
+        )
+    else:
+        bullets.append(f"✅ Signal confidence: **{confidence:.0%}** — clear acquisition")
 
-
-def _fetch_xom(period: str = "1mo") -> pd.DataFrame:
-    try:
-        raw = yf.download("XOM", period=period, interval="1d",
-                          progress=False, auto_adjust=True)
-        if raw.empty:
-            return pd.DataFrame(columns=["Date", "Close"])
-        df = raw[["Close"]].reset_index()
-        df.columns = ["Date", "Close"]
-        df["Date"] = pd.to_datetime(df["Date"]).dt.date
-        return df.dropna()
-    except Exception:
-        return pd.DataFrame(columns=["Date", "Close"])
+    return bullets
 
 
-# ── Public API ──────────────────────────────────────────────────────────────────
+# ── Equity data fetcher ──────────────────────────────────────────────────────────
 
-def analyse(
-    current_detection: dict,
-    history: list[dict],
-    port: str = "",
-    ticker: str = "",
-) -> TrendReport:
+def _fetch_equity(
+    ticker:    str,
+    corr:      float,
+    deviation: Optional[float],
+    pressure:  bool,
+) -> EquitySnapshot:
     """
+    Retrieve last close, Market Cap, and trailing P/E from yfinance.
+    Compute Projected Value Delta when the Supply Pressure gate is active.
+
+    Valuation model
+    ---------------
+    price_Δ% ≈ transit_deviation_fraction × correlation_coefficient
+
+    The model is a linear elasticity approximation derived from 5-year
+    back-tests.  It is provided as a reference frame for relative sizing,
+    not as an absolute price forecast.
+
     Parameters
     ----------
-    current_detection : dict
-        The ``detection`` block from telemetry.json:
-        ``{"ship_count": 14, "confidence_mean": 0.83,
-           "vessel_breakdown": {"tankers": 8, "bulk_carriers": 3, "container": 3}}``
-    history : list[dict]
-        Prior observations accumulated in ``st.session_state``:
-        ``[{"timestamp": "<iso>", "ship_count": <int>}, ...]``
-    port : str
-        Port identifier from the telemetry ``scene`` block.
-    ticker : str
-        Equity ticker from the alpha_signal block (e.g. "XOM").
-        Used by the Valuation Impact Module.
+    ticker    : str   Equity symbol (e.g. "XOM")
+    corr      : float Shipping→price Pearson r for this instrument
+    deviation : float (current − index) / index; None when baseline absent
+    pressure  : bool  True when deviation > PRESSURE_GATE
     """
-    detect = current_detection or {}
-    ship_count: Optional[int] = detect.get("ship_count")
-    vb: dict = detect.get("vessel_breakdown") or {}
+    last_close: Optional[float] = None
+    market_cap: Optional[float] = None
+    pe_ratio:   Optional[float] = None
 
-    # Dominant vessel type
-    dominant_type = max(vb, key=lambda k: vb.get(k) or 0) if vb else "unknown"
+    try:
+        yf_t  = yf.Ticker(ticker)
+        fi    = yf_t.fast_info
 
-    # Baseline
-    counts = [h["ship_count"] for h in history if h.get("ship_count") is not None]
-    baseline: Optional[float] = sum(counts) / len(counts) if len(counts) >= 3 else None
-    delta: Optional[float] = (
-        (ship_count - baseline) / baseline
-        if baseline and ship_count is not None else None
+        last_close = float(fi.last_price)  if getattr(fi, "last_price",  None) else None
+        market_cap = float(fi.market_cap)  if getattr(fi, "market_cap",  None) else None
+
+        # P/E is not in fast_info — use the heavier info dict (cached by yfinance)
+        info   = yf_t.info
+        pe_raw = info.get("trailingPE") or info.get("forwardPE")
+        pe_ratio = float(pe_raw) if pe_raw else None
+
+    except Exception as exc:
+        log.debug("yfinance fetch failed for %s: %s", ticker, exc)
+
+    # Projected Value Delta
+    # Gate: deviation must be present AND > PRESSURE_GATE
+    projected_delta_pct: Optional[float] = None
+    projected_delta_usd: Optional[float] = None
+
+    if pressure and deviation is not None:
+        projected_delta_pct = deviation * corr  # linear elasticity
+        if last_close is not None:
+            projected_delta_usd = last_close * projected_delta_pct
+
+    return EquitySnapshot(
+        ticker=ticker,
+        last_close=last_close,
+        market_cap=market_cap,
+        pe_ratio=pe_ratio,
+        correlation_coeff=corr,
+        projected_delta_pct=projected_delta_pct,
+        projected_delta_usd=projected_delta_usd,
+        pressure_triggered=pressure,
     )
-    direction = _direction(delta)
 
-    type_key = dominant_type if dominant_type in _RECO else "unknown"
-    insight_category, recommendation = _RECO[type_key][direction]
 
-    label    = _trend_label(dominant_type, delta, ship_count, baseline, direction, port)
-    insights = _build_insights(dominant_type, direction, delta, ship_count, port)
+# ── Public API ───────────────────────────────────────────────────────────────────
 
-    # Ship series
-    all_pts = list(history)
-    if ship_count is not None:
-        all_pts.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ship_count": ship_count,
-        })
-    if all_pts:
-        ship_df = pd.DataFrame(all_pts)[["timestamp", "ship_count"]].dropna()
-        ship_df["timestamp"] = pd.to_datetime(ship_df["timestamp"], format="ISO8601", utc=True)
-        ship_df = ship_df.sort_values("timestamp").set_index("timestamp")
+def analyse() -> TrendReport:
+    """
+    Read data/energy_flow.csv and return a fully-populated TrendReport.
+
+    This is the sole public entry point for dashboard.py.
+    The function is stateless and idempotent — safe to call in a
+    Streamlit while-True refresh loop at any cadence.
+
+    Returns
+    -------
+    TrendReport
+        All fields populated; equity snapshots are None when no flow
+        data has been recorded yet (Orion has not yet run).
+    """
+    df = _load_flow()
+
+    # Latest observation values
+    has_data          = len(df) > 0
+    current_count     = int(df["tanker_count"].iloc[-1])    if has_data else None
+    confidence_latest = float(df["confidence_score"].iloc[-1]) if has_data else 1.0
+
+    # Supply Index (30-observation rolling mean)
+    supply_idx = _supply_index(df)
+
+    # Deviation fraction: (current − baseline) / baseline
+    deviation: Optional[float] = None
+    if supply_idx and supply_idx > 0 and current_count is not None:
+        deviation = (current_count - supply_idx) / supply_idx
+
+    # Supply Pressure gate
+    pressure = (deviation is not None) and (deviation > PRESSURE_GATE)
+
+    # Flow series: last 288 rows (≈ 24 h at 5-min cadence) for line chart
+    flow_df: pd.DataFrame
+    if has_data:
+        flow_df = (
+            df[["timestamp", "tanker_count"]]
+            .set_index("timestamp")
+            .tail(288)
+        )
     else:
-        ship_df = pd.DataFrame(columns=["ship_count"])
+        flow_df = pd.DataFrame(columns=["tanker_count"])
 
-    # Valuation Impact Module — only fetches live data when a ticker is known
-    valuation = _fetch_valuation(ticker, delta) if ticker and ticker != "—" else None
+    # Narrative strings
+    transit_vol = _build_transit_narrative(
+        current_count or 0, supply_idx, deviation, pressure
+    )
+    insight = _build_supply_insight(pressure, deviation, confidence_latest)
+    bullets = _build_sidebar_bullets(
+        current_count, supply_idx, deviation, pressure, confidence_latest
+    )
+
+    # Equity snapshots (only fetch live data when flow data is present)
+    xom = _fetch_equity("XOM", XOM_CORR, deviation, pressure) if has_data else None
+    uso = _fetch_equity("USO", USO_CORR, deviation, pressure) if has_data else None
 
     return TrendReport(
-        trend_label=label,
-        recommendation=recommendation,
-        insight_category=insight_category,
-        delta_vs_baseline=delta,
-        current_count=ship_count,
-        baseline_count=baseline,
-        dominant_type=dominant_type,
-        ship_series=ship_df,
-        xom_series=_fetch_xom(),
-        valuation=valuation,
-        insights=insights,
+        supply_index=supply_idx,
+        deviation_pct=deviation,
+        pressure_flag=pressure,
+        inward_transit_vol=transit_vol,
+        supply_insight=insight,
+        sidebar_bullets=bullets,
+        flow_series=flow_df,
+        confidence_latest=confidence_latest,
+        xom=xom,
+        uso=uso,
     )
