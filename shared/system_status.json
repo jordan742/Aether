@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-03-30T13:25:02.784100+00:00",
+  "processes": {
+    "on_orbit_sim": {
+      "alive": true,
+      "pid": 9650,
+      "restart_count": 0,
+      "uptime_s": 70.0,
+      "exit_code": null
+    },
+    "trader": {
+      "alive": true,
+      "pid": 12230,
+      "restart_count": 7,
+      "uptime_s": 0.0,
+      "exit_code": null
+    }
+  }
+}
