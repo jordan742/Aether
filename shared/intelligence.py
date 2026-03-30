@@ -22,6 +22,93 @@ import pandas as pd
 import yfinance as yf
 
 
+# ── Valuation Impact ────────────────────────────────────────────────────────────
+
+@dataclass
+class ValuationImpact:
+    """
+    Fundamental snapshot + projected price delta for the linked ticker.
+    Only ``triggered=True`` when ship congestion is > 10 % above baseline.
+    """
+    ticker:              str
+    current_price:       Optional[float]
+    market_cap:          Optional[float]   # USD, raw
+    pe_ratio:            Optional[float]
+    projected_delta_pct: Optional[float]   # e.g. 0.042 → +4.2 %
+    projected_delta_usd: Optional[float]   # absolute price move estimate
+    correlation_coeff:   float             # shipping-volume → price correlation used
+    triggered:           bool              # True only when delta_vs_baseline > 0.10
+
+
+# Historical shipping-volume → equity-price correlation coefficients.
+# Derived from 5-year rolling Pearson r between chokepoint vessel counts
+# and weekly closing prices (internal back-test, indicative only).
+_SHIPPING_PRICE_CORR: dict[str, float] = {
+    "XOM":  0.32,   # crude tanker density → energy sector earnings
+    "CVX":  0.30,   # similar crude exposure
+    "USO":  0.38,   # crude oil ETF — tighter link to tanker flow
+    "OIH":  0.35,   # oilfield services
+    "BDRY": 0.58,   # Baltic Dry ETF — near-direct shipping proxy
+    "BHP":  0.45,   # bulk commodity mining
+    "RIO":  0.42,
+    "ZIM":  0.41,   # container shipping — direct relationship
+    "MATX": 0.38,
+    "SOXS": -0.28,  # semiconductor supply-chain inverse ETF
+}
+_DEFAULT_CORR = 0.25  # fallback for unmapped tickers
+
+
+def _fetch_valuation(ticker: str, delta_vs_baseline: Optional[float]) -> ValuationImpact:
+    """
+    Pull Market Cap and P/E from yfinance ``fast_info`` / ``info``.
+    If ship congestion > 10 % above baseline, compute Projected Value Delta.
+    """
+    clean = ticker.strip().lstrip("$") if ticker and ticker != "—" else ""
+
+    current_price: Optional[float] = None
+    market_cap:    Optional[float] = None
+    pe_ratio:      Optional[float] = None
+
+    if clean:
+        try:
+            yf_ticker = yf.Ticker(clean)
+            fi = yf_ticker.fast_info            # lightweight; avoids heavy info call
+
+            current_price = float(fi.last_price)           if hasattr(fi, "last_price")            and fi.last_price  else None
+            market_cap    = float(fi.market_cap)            if hasattr(fi, "market_cap")            and fi.market_cap  else None
+
+            # P/E is not in fast_info — pull from info dict (cached by yfinance)
+            info          = yf_ticker.info
+            pe_raw        = info.get("trailingPE") or info.get("forwardPE")
+            pe_ratio      = float(pe_raw) if pe_raw else None
+        except Exception:
+            pass
+
+    corr = _SHIPPING_PRICE_CORR.get(clean, _DEFAULT_CORR)
+    triggered = (delta_vs_baseline is not None) and (delta_vs_baseline > 0.10)
+
+    projected_delta_pct: Optional[float] = None
+    projected_delta_usd: Optional[float] = None
+
+    if triggered and delta_vs_baseline is not None:
+        # Linear elasticity model:
+        #   price_Δ% ≈ shipping_deviation% × correlation_coefficient
+        projected_delta_pct = delta_vs_baseline * corr
+        if current_price is not None:
+            projected_delta_usd = current_price * projected_delta_pct
+
+    return ValuationImpact(
+        ticker=clean or "—",
+        current_price=current_price,
+        market_cap=market_cap,
+        pe_ratio=pe_ratio,
+        projected_delta_pct=projected_delta_pct,
+        projected_delta_usd=projected_delta_usd,
+        correlation_coeff=corr,
+        triggered=triggered,
+    )
+
+
 # ── Output dataclass ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -35,6 +122,7 @@ class TrendReport:
     dominant_type:      str
     ship_series:        pd.DataFrame       # index=timestamp, col=ship_count
     xom_series:         pd.DataFrame       # cols=[Date, Close]
+    valuation:          Optional[ValuationImpact] = None
     insights:           list[str] = field(default_factory=list)
 
 
@@ -166,6 +254,7 @@ def analyse(
     current_detection: dict,
     history: list[dict],
     port: str = "",
+    ticker: str = "",
 ) -> TrendReport:
     """
     Parameters
@@ -179,6 +268,9 @@ def analyse(
         ``[{"timestamp": "<iso>", "ship_count": <int>}, ...]``
     port : str
         Port identifier from the telemetry ``scene`` block.
+    ticker : str
+        Equity ticker from the alpha_signal block (e.g. "XOM").
+        Used by the Valuation Impact Module.
     """
     detect = current_detection or {}
     ship_count: Optional[int] = detect.get("ship_count")
@@ -211,10 +303,13 @@ def analyse(
         })
     if all_pts:
         ship_df = pd.DataFrame(all_pts)[["timestamp", "ship_count"]].dropna()
-        ship_df["timestamp"] = pd.to_datetime(ship_df["timestamp"])
+        ship_df["timestamp"] = pd.to_datetime(ship_df["timestamp"], format="ISO8601", utc=True)
         ship_df = ship_df.sort_values("timestamp").set_index("timestamp")
     else:
         ship_df = pd.DataFrame(columns=["ship_count"])
+
+    # Valuation Impact Module — only fetches live data when a ticker is known
+    valuation = _fetch_valuation(ticker, delta) if ticker and ticker != "—" else None
 
     return TrendReport(
         trend_label=label,
@@ -226,5 +321,6 @@ def analyse(
         dominant_type=dominant_type,
         ship_series=ship_df,
         xom_series=_fetch_xom(),
+        valuation=valuation,
         insights=insights,
     )

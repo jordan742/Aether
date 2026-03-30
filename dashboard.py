@@ -41,7 +41,7 @@ def _secret(key: str, default: str = "") -> str:
 # ── Intelligence engine ─────────────────────────────────────────────────────────
 import sys
 sys.path.insert(0, str(_ROOT))
-from shared.intelligence import analyse, TrendReport  # noqa: E402
+from shared.intelligence import analyse, TrendReport, ValuationImpact  # noqa: E402
 
 # ── Page config ─────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -91,6 +91,16 @@ hr          { border-color: #00D4FF22 !important; }
 .insight-cat-BEARISH { color:#FF3344; font-weight:700; }
 .insight-cat-WATCH   { color:#FFB800; font-weight:700; }
 .insight-cat-NEUTRAL { color:#556677; font-weight:700; }
+
+.valuation-box { background:#070D18; border:2px solid #00D4FF55;
+                 border-radius:8px; padding:16px 20px; margin-top:6px; }
+.valuation-triggered { border-color:#00FF88 !important;
+                       box-shadow:0 0 18px #00FF8833; }
+.val-label { font-size:.65rem; letter-spacing:.16em; text-transform:uppercase;
+             color:#00D4FF; margin-bottom:8px; }
+.val-delta-pos { font-size:1.4rem; font-weight:800; color:#00FF88; }
+.val-delta-neg { font-size:1.4rem; font-weight:800; color:#FF3344; }
+.val-delta-nil { font-size:1.0rem; color:#556677; font-style:italic; }
 
 [data-testid="stDataFrame"] thead th {
     background:#0D1520 !important; color:#00D4FF !important;
@@ -185,7 +195,7 @@ while True:
         st.session_state.ship_history = st.session_state.ship_history[-288:]
 
     # Run intelligence engine (caches XOM for 5 min via yfinance)
-    report: TrendReport = analyse(detect, st.session_state.ship_history, port)
+    report: TrendReport = analyse(detect, st.session_state.ship_history, port, ticker)
 
     # ── Sidebar: Strategic Insights ─────────────────────────────────────────────
     with st.sidebar:
@@ -218,6 +228,61 @@ while True:
                       delta=f"{xom_delta:+.2f}")
         else:
             st.info("XOM data unavailable.")
+
+        # ── Strategic Valuation Insight ─────────────────────────────────────────
+        st.divider()
+        st.markdown("**📐 Strategic Valuation Insight**")
+        v: ValuationImpact | None = report.valuation
+        if v is None:
+            st.caption("Valuation module active once ticker is identified.")
+        else:
+            triggered_cls = "valuation-triggered" if v.triggered else ""
+
+            # Projected delta HTML
+            if v.triggered and v.projected_delta_pct is not None and v.projected_delta_usd is not None:
+                sign       = "+" if v.projected_delta_usd >= 0 else ""
+                delta_cls  = "val-delta-pos" if v.projected_delta_usd >= 0 else "val-delta-neg"
+                delta_html = (
+                    f'<div class="{delta_cls}">'
+                    f'{sign}{v.projected_delta_pct:.1%} &nbsp; ({sign}${v.projected_delta_usd:.2f})'
+                    f'</div>'
+                    f'<div style="font-size:.75rem;color:#8899AA;margin-top:4px">'
+                    f'Corr. coeff: {v.correlation_coeff:.2f} &nbsp;·&nbsp; '
+                    f'Congestion gate: &gt;10% ✅'
+                    f'</div>'
+                )
+                gate_note = ""
+            else:
+                delta_html = (
+                    '<div class="val-delta-nil">Gate not triggered</div>'
+                    '<div style="font-size:.75rem;color:#556677;margin-top:4px">'
+                    'Requires ship congestion &gt;10% above baseline</div>'
+                )
+                gate_note = ""
+
+            mcap_str = (
+                f"${v.market_cap / 1e9:.1f}B"
+                if v.market_cap and v.market_cap >= 1e9
+                else f"${v.market_cap / 1e6:.0f}M"
+                if v.market_cap
+                else "—"
+            )
+            pe_str = f"{v.pe_ratio:.1f}×" if v.pe_ratio else "—"
+            price_str = f"${v.current_price:.2f}" if v.current_price else "—"
+
+            st.markdown(
+                f'<div class="valuation-box {triggered_cls}">'
+                f'<div class="val-label">Projected Value Delta — ${v.ticker}</div>'
+                f'{delta_html}'
+                f'<hr style="border-color:#00D4FF11;margin:10px 0"/>'
+                f'<table style="width:100%;font-size:.8rem;color:#C9D1D9">'
+                f'<tr><td>Price</td><td style="text-align:right">{price_str}</td></tr>'
+                f'<tr><td>Market Cap</td><td style="text-align:right">{mcap_str}</td></tr>'
+                f'<tr><td>P/E Ratio</td><td style="text-align:right">{pe_str}</td></tr>'
+                f'</table>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         st.divider()
         st.markdown("**Configuration**")
