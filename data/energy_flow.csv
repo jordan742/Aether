@@ -493,3 +493,4 @@ timestamp,tanker_count,confidence_score,cloud_flag,lat,lon,source
 2026-07-30T13:51:09.771737+00:00,8,0.4847,False,35.9,-5.3,simulation
 2026-07-30T19:20:24.452063+00:00,6,0.7946,False,35.9,-5.3,simulation
 2026-07-31T02:30:02.224190+00:00,10,0.8009,False,35.9,-5.3,simulation
+2026-07-31T08:44:25.111007+00:00,4,0.6452,False,35.9,-5.3,simulation
