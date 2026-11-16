@@ -884,3 +884,4 @@ timestamp,tanker_count,confidence_score,cloud_flag,lat,lon,source
 2026-11-15T13:23:58.945126+00:00,2,0.8242,False,35.9,-5.3,simulation
 2026-11-15T22:26:45.752681+00:00,6,1.0,False,35.9,-5.3,simulation
 2026-11-16T04:37:33.313430+00:00,10,1.0,False,35.9,-5.3,simulation
+2026-11-16T14:40:13.226366+00:00,6,1.0,False,35.9,-5.3,simulation
